@@ -1,15 +1,14 @@
 // Pump.fun Bot Sprint: Make Bot And Win — momentum bot for pumpfun-replay/v2.
 //
-// Strategy: ride the opening burst. A new coin's first slots decide it: heavy
-// early buying pushes the price up fast and the runners keep climbing for
-// hundreds of slots, while dead coins barely move. Buy only inside the first
-// ~300 slots, only when the price is already up 8% on 1.5+ SOL of buy-dominated
-// flow and still rising. No fixed take-profit: a trailing stop armed at +10%
-// sells on an 8% pullback from the peak, so winners run and losers are cut on
-// a 12% stop, a dump in flow, or a flat time exit. Everything is
-// deterministic: no wall clock, no unseeded randomness, no network. Decisions
-// come only from the hello seed, the batch slot, the marks, and the events in
-// each batch.
+// Strategy: ride the sustained grind, never the opening spike. A new coin's
+// first slots are a trap: the price jumps on the first big buys and usually
+// reverts. This bot waits until a coin is 100-3000 slots old, already up 50%
+// from creation, still rising over the last 1000 slots on 1+ SOL of
+// buy-dominated flow. Exits are a 12% take-profit and a tight 4% stop; there
+// is no trailing stop (backtests showed it cut winners early) and no fixed
+// time exit before 8000 slots. Everything is deterministic: no wall clock,
+// no unseeded randomness, no network. Decisions come only from the hello
+// seed, the batch slot, the marks, and the events in each batch.
 //
 // The harness speaks NDJSON on stdin/stdout; the vendored SDK (vendor/) owns
 // that protocol. This file only decides orders via runBot's onBatch hook.
@@ -26,17 +25,21 @@ import {
 // ---- tunables (lamports; 1 SOL = 1_000_000_000) ---------------------------
 const BUY_TARGET = 500_000_000n; // 0.50 SOL per entry, before caps
 const MIN_BUY = 30_000_000n; // 0.03 SOL: smallest buy worth its fees
-const MAX_SLIPPAGE_BPS = 500; // 5%: bursts move fast, fills lag 2 slots
-const MAX_AGE_SLOTS = 300; // only coins created within ~1 min: ride the burst
-const FLOW_WINDOW_SLOTS = 3_000; // trailing flow window (~11 min)
-const MOMENTUM_WINDOW_SLOTS = 300; // recent-rise window (~1 min)
-const MIN_RISE_FROM_CREATION_BPS = 800; // +8% from creation price
-const BURST_MIN_BUY_SOL = 1_500_000_000n; // 1.5 SOL of buys since creation
-const BUY_DOMINANCE_NUM = 2; // buys >= 2x sells since creation
+const MAX_SLIPPAGE_BPS = 500; // 5%: fills lag 2 slots, prices move fast
+const MIN_AGE_SLOTS = 100; // only coins at least ~20 s old: never the spike
+const MAX_AGE_SLOTS = 3_000; // only coins created within ~11 min
+const FLOW_WINDOW_SLOTS = 1_000; // trailing flow window (~4 min)
+const MOMENTUM_WINDOW_SLOTS = 1_000; // recent-rise window (~4 min)
+const MIN_RISE_FROM_CREATION_BPS = 5_000; // +50% from creation price
+const MIN_BUY_FLOW_SOL = 1_000_000_000n; // 1 SOL of buys in the window
+const BUY_DOMINANCE_NUM = 2; // buys >= 2x sells in the window
 const BUY_DOMINANCE_DEN = 1;
-const STOP_LOSS_BPS = 1_200; // -12% on cost basis
-const TRAILING_DROP_BPS = 800; // -8% from the peak value
-const TRAILING_ARM_BPS = 1_000; // arm the trailing exit only once +10% up
+const TAKE_PROFIT_BPS = 1_200; // +12% on cost basis
+const STOP_LOSS_BPS = 400; // -4% on cost basis: cut losers fast
+// Trailing stop disabled (backtests: it cut winners early). The arm is set
+// past any reachable gain; the time exit below then applies at MAX_HOLD_SLOTS.
+const TRAILING_DROP_BPS = 500;
+const TRAILING_ARM_BPS = 100_000;
 const MAX_HOLD_SLOTS = 8_000; // time exit (~28 min after entry)
 const EXIT_COOLDOWN_SLOTS = 5_000; // do not re-buy a mint just exited
 const DUMP_SELL_NUM = 2; // sells >= 2x buys in the short window -> dump
@@ -197,8 +200,8 @@ function onBatch(state: BotState, batch: Batch): OrderInput[] {
     const value =
       (tokens * curve.virtual_quote_reserves) / curve.virtual_token_reserves;
     if (value > t.peakValue) t.peakValue = value;
-    // No fixed take-profit: runners keep climbing for hundreds of slots,
-    // so the trailing stop does the selling and lets winners run.
+    // Fixed take-profit and tight stop: the grind either pays quickly or
+    // the entry was wrong, so bank +12% and cut -4% without waiting.
     const gainBps = riseBps(value, 1n, cost, 1n);
     const lossBps = dropBps(value, 1n, cost, 1n);
     const peakGainBps =
@@ -209,10 +212,12 @@ function onBatch(state: BotState, batch: Batch): OrderInput[] {
     const dumping =
       flow.sell >= BigInt(DUMP_SELL_NUM) * flow.buy && flow.sell > 0n && gainBps < 200n;
     const done = curve.complete === true;
-    // Time exit only while flat: a position still climbing keeps its slot.
+    // Time exit at MAX_HOLD_SLOTS (trailing is disabled, so the arm check
+    // always passes); in practice TP/SL resolve positions well before this.
     const tooOld =
       slot - t.entrySlot > MAX_HOLD_SLOTS && gainBps < TRAILING_ARM_BPS;
     if (
+      gainBps >= TAKE_PROFIT_BPS ||
       lossBps >= STOP_LOSS_BPS ||
       (peakGainBps >= TRAILING_ARM_BPS && peakDropBps >= TRAILING_DROP_BPS) ||
       dumping ||
@@ -253,17 +258,17 @@ function onBatch(state: BotState, batch: Batch): OrderInput[] {
       const t = trackFor(mint);
       if (t.createdSlot < 0 || t.first === null || t.last === null) continue;
       const age = slot - t.createdSlot;
-      if (age < 0 || age > MAX_AGE_SLOTS) continue;
+      if (age < MIN_AGE_SLOTS || age > MAX_AGE_SLOTS) continue;
       if (slot - t.exitedSlot < EXIT_COOLDOWN_SLOTS && t.exitedSlot >= 0) continue;
-      // The burst: price already up from creation on heavy early buying.
+      // The grind: price well up from creation on sustained buying.
       const riseFromCreation = riseBps(t.last.n, t.last.d, t.first.n, t.first.d);
       if (riseFromCreation < MIN_RISE_FROM_CREATION_BPS) continue;
-      // Still rising, not already rolling over: price no lower than 300 slots ago.
+      // Still rising, not already rolling over: price no lower than 1000 slots ago.
       const past = priceAtOrBefore(t, slot - MOMENTUM_WINDOW_SLOTS);
       if (past !== null && priceGe(past.n, past.d, t.last.n, t.last.d)) continue;
-      // Flow since creation (age <= 300 slots, so this window covers it).
-      const flow = flowInWindow(t, slot, MAX_AGE_SLOTS);
-      if (flow.buy < BURST_MIN_BUY_SOL) continue;
+      // Sustained flow in the trailing window, buys dominating sells.
+      const flow = flowInWindow(t, slot, FLOW_WINDOW_SLOTS);
+      if (flow.buy < MIN_BUY_FLOW_SOL) continue;
       if (flow.buy * BigInt(BUY_DOMINANCE_DEN) < flow.sell * BigInt(BUY_DOMINANCE_NUM)) continue;
       const cap = state.maxBuyLamports(mint);
       let size = BUY_TARGET;
