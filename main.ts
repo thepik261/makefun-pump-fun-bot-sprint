@@ -181,8 +181,7 @@ function onBatch(state: BotState, batch: Batch): OrderInput[] {
 
   // ---- exits: check every open position first -----------------------------
   const held = new Set<string>();
-  for (const pos of state.positions) {
-    const mint = pos.mint;
+  for (const [mint, pos] of state.positions) {
     held.add(mint);
     const t = trackFor(mint);
     const curve = state.curves.get(mint);
