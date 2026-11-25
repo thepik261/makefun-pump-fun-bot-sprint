@@ -200,7 +200,7 @@ function onBatch(state: BotState, batch: Batch): OrderInput[] {
       t.peakValue > 0n ? dropBps(value, 1n, t.peakValue, 1n) : 0n;
     const flow = flowInWindow(t, slot, DUMP_WINDOW_SLOTS);
     const dumping =
-      flow.sell >= DUMP_SELL_NUM * flow.buy && flow.sell > 0n && gainBps < 200n;
+      flow.sell >= BigInt(DUMP_SELL_NUM) * flow.buy && flow.sell > 0n && gainBps < 200n;
     const done = curve.complete === true;
     const tooOld = slot - t.entrySlot > MAX_HOLD_SLOTS;
     if (
